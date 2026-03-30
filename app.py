@@ -1,4 +1,6 @@
 import datetime
+import smtplib
+from email.mime.text import MIMEText
 
 import folium
 import pandas as pd
@@ -7,44 +9,76 @@ from streamlit_folium import st_folium
 from supabase import create_client
 
 # ==========================================
-# 1. PAGE CONFIG & DATABASE CONNECTION
+# 1. PAGE CONFIG & CUSTOM CSS
 # ==========================================
 st.set_page_config(page_title="Norstar Imports Tracker", layout="wide")
 
+st.markdown("""
+    <style>
+    div[data-baseweb="input"] { border: 2px solid #707070 !important; border-radius: 5px !important; background-color: #ffffff !important; }
+    div[data-baseweb="select"] > div { border: 2px solid #707070 !important; border-radius: 5px !important; background-color: #ffffff !important; }
+    input { color: #000000 !important; }
+    </style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# 2. AUTHENTICATION (LOGIN WALL)
+# ==========================================
+if "role" not in st.session_state:
+    st.session_state.role = None
+
+if st.session_state.role is None:
+    st.title("🚢 Norstar Logistics Portal")
+    st.divider()
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.subheader("🔒 Secure Login")
+        with st.form("login_form"):
+            username = st.text_input("Username (admin or viewer)").lower().strip()
+            password = st.text_input("Password", type="password")
+            
+            if st.form_submit_button("Log In", type="primary", use_container_width=True):
+                if username == "admin" and password == st.secrets["ADMIN_PASS"]:
+                    st.session_state.role = "Admin"
+                    st.rerun()
+                elif username == "viewer" and password == st.secrets["VIEWER_PASS"]:
+                    st.session_state.role = "Viewer"
+                    st.rerun()
+                else:
+                    st.error("Incorrect username or password.")
+    st.stop()
+
+# Logout Button in Sidebar
+with st.sidebar:
+    st.write(f"Logged in as: **{st.session_state.role}**")
+    if st.button("Logout"):
+        st.session_state.role = None
+        st.rerun()
+
+# ==========================================
+# 3. DATABASE CONNECTION & HELPER FUNCTIONS
+# ==========================================
 @st.cache_resource
 def init_connection():
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_KEY"]
-    return create_client(url, key)
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 supabase = init_connection()
 
-st.title("🚢 Norstar Product Tracking Dashboard")
-
-# --- INJECT CUSTOM CSS FOR VISIBLE INPUT BORDERS ---
-st.markdown("""
-    <style>
-    /* Put a solid dark gray border around all text, number, and date input blanks */
-    div[data-baseweb="input"] {
-        border: 2px solid #707070 !important;
-        border-radius: 5px !important;
-        background-color: #ffffff !important;
-    }
-    
-    /* Put a solid dark gray border around all dropdown menus (selectboxes) */
-    div[data-baseweb="select"] > div {
-        border: 2px solid #707070 !important;
-        border-radius: 5px !important;
-        background-color: #ffffff !important;
-    }
-    
-    /* Ensure the text typed inside is dark and easy to read */
-    input {
-        color: #000000 !important;
-    }
-    </style>
-""", unsafe_allow_html=True)
-st.divider() # Just adds a nice clean line under the title
+def send_status_alert(po_number, new_status):
+    try:
+        sender = st.secrets["SENDER_EMAIL"]
+        pwd = st.secrets["SENDER_PASS"]
+        receiver = st.secrets["RECEIVER_EMAIL"]
+        msg = MIMEText(f"Hello,\n\nThe status for Container/PO {po_number} has been updated to: {new_status}.\n\nPlease check the Norstar Tracker Portal for details.")
+        msg['Subject'] = f"🚨 Logistics Alert: PO {po_number} is now {new_status}"
+        msg['From'] = sender
+        msg['To'] = receiver
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(sender, pwd)
+            server.send_message(msg)
+    except Exception as e:
+        st.error(f"Could not send email alert. Error: {e}")
 
 STATUS_COORDS = {
     "Factory (Shanghai)": [31.2304, 121.4737],
@@ -55,9 +89,6 @@ STATUS_COORDS = {
     "Delivered (Cuauhtémoc)": [28.4046, -106.8656]
 }
 
-# ==========================================
-# 2. FETCH MASTER DATA & INIT SESSION STATE
-# ==========================================
 vendors_res = supabase.table("vendors").select("*").execute()
 vendor_data = vendors_res.data if vendors_res.data else []
 vendor_list = [v['vendor_name'] for v in vendor_data]
@@ -68,15 +99,18 @@ product_data = products_res.data if products_res.data else []
 if 'draft_container' not in st.session_state:
     st.session_state.draft_container = []
 
+st.title("🚢 Norstar Product Tracking Dashboard")
+
 # ==========================================
-# 3. NAVIGATION TABS
+# 4. ROLE-BASED NAVIGATION
 # ==========================================
-tab_dash, tab_build, tab_add, tab_manage = st.tabs([
-    "🌍 Live Dashboard", 
-    "🏗️ Container Builder", 
-    "📦 Quick Add", 
-    "🏢 Manage Data"
-])
+if st.session_state.role == "Admin":
+    tabs = st.tabs(["🌍 Live Dashboard", "🏗️ Container Builder", "📦 Quick Add", "🏢 Manage Data"])
+    tab_dash, tab_build, tab_add, tab_manage = tabs
+else:
+    tabs = st.tabs(["🌍 Live Dashboard"])
+    tab_dash = tabs[0]
+    tab_build = tab_add = tab_manage = None
 
 # ==========================================
 # TAB 1: LIVE DASHBOARD
@@ -87,17 +121,11 @@ with tab_dash:
 
     if not df.empty:
         col1, col2, col3 = st.columns(3)
-        active_count = df[df['status'] != "Delivered (Cuauhtémoc)"]['po_number'].nunique()
-        ocean_count = df[df['status'] == "In Transit (Ocean)"]['po_number'].nunique()
-        customs_count = df[df['status'] == "Customs (Manzanillo)"]['po_number'].nunique()
-        
-        col1.metric("Active Containers (POs)", active_count)
-        col2.metric("In Transit (Ocean)", ocean_count)
-        col3.metric("At Customs", customs_count)
-
+        col1.metric("Active Containers", df[df['status'] != "Delivered (Cuauhtémoc)"]['po_number'].nunique())
+        col2.metric("In Transit (Ocean)", df[df['status'] == "In Transit (Ocean)"]['po_number'].nunique())
+        col3.metric("At Customs", df[df['status'] == "Customs (Manzanillo)"]['po_number'].nunique())
         st.divider()
 
-        # DUAL CAPACITY TRACKER
         st.subheader("⚖️ Container Capacity Tracker")
         if 'total_weight_kg' in df.columns and 'total_volume_cu_ft' in df.columns:
             containers = df.groupby(['po_number', 'max_capacity_kg', 'max_volume_cu_ft'])[['total_weight_kg', 'total_volume_cu_ft']].sum().reset_index()
@@ -105,390 +133,321 @@ with tab_dash:
             for idx, row in containers.iterrows():
                 with cols[idx % 3]:
                     st.markdown(f"**PO / Container: {row['po_number']}**")
-                    curr_w = float(row['total_weight_kg'])
-                    max_w = float(row['max_capacity_kg'])
-                    curr_v = float(row['total_volume_cu_ft'])
-                    max_v = float(row['max_volume_cu_ft'])
+                    curr_w, max_w = float(row['total_weight_kg']), float(row['max_capacity_kg'])
+                    curr_v, max_v = float(row['total_volume_cu_ft']), float(row['max_volume_cu_ft'])
                     
                     st.caption(f"**Weight:** {curr_w:,.0f} / {max_w:,.0f} kg")
                     st.progress(min(curr_w / max_w if max_w > 0 else 0, 1.0))
-                    
                     st.caption(f"**Space:** {curr_v:,.0f} / {max_v:,.0f} cu ft")
                     st.progress(min(curr_v / max_v if max_v > 0 else 0, 1.0))
                     st.write("") 
-        else:
-            st.info("Missing dimensions or weight in database.")
+
+        if st.session_state.role == "Admin":
+            st.divider()
+            st.subheader("💰 Financials & Lead Time Analysis")
+            if 'container_freight_usd' in df.columns and 'eta' in df.columns:
+                unique_pos = df['po_number'].unique()
+                for po in unique_pos:
+                    po_df = df[df['po_number'] == po]
+                    freight_cost = float(po_df['container_freight_usd'].iloc[0]) if not pd.isna(po_df['container_freight_usd'].iloc[0]) else 0
+                    total_po_weight = po_df['total_weight_kg'].sum()
+                    eta_str = po_df['eta'].iloc[0]
+                    status = po_df['status'].iloc[0]
+                    
+                    timeline_status = "Unknown"
+                    if eta_str:
+                        eta_date = datetime.datetime.strptime(str(eta_str), "%Y-%m-%d").date()
+                        days_diff = (eta_date - datetime.date.today()).days
+                        if "Delivered" in str(status): timeline_status = "✅ Arrived"
+                        elif days_diff < 0: timeline_status = f"🚨 LATE by {abs(days_diff)} days"
+                        else: timeline_status = f"⏳ ETA in {days_diff} days"
+
+                    with st.expander(f"📦 Details for {po} | Status: {status} | {timeline_status}"):
+                        st.write(f"**Container Freight:** ${freight_cost:,.2f}")
+                        calc_data = []
+                        for _, row in po_df.iterrows():
+                            total_parts = row.get('total_parts')
+                            if pd.isna(total_parts): total_parts = row['quantity']
+                            
+                            qty_units = float(row['quantity'])
+                            weight = float(row['total_weight_kg'])
+                            prod_name = row['product']
+                            
+                            base_price = float(next((p.get('price_usd') or 0 for p in product_data if p['product_name'] == prod_name), 0))
+                            
+                            freight_per_part = (freight_cost * (weight / total_po_weight)) / float(total_parts) if total_po_weight > 0 and float(total_parts) > 0 else 0
+                            
+                            calc_data.append({
+                                "Product": prod_name, "Shipping Qty": qty_units, "Total Parts": total_parts,
+                                "Base Price (ea)": f"${base_price:,.2f}", "Freight Share (ea)": f"${freight_per_part:,.2f}", 
+                                "TRUE LANDED COST (ea)": f"${base_price + freight_per_part:,.2f}"
+                            })
+                        st.table(pd.DataFrame(calc_data))
 
         st.divider()
-
-        # --- NEW: LANDED COST & TIMELINE ANALYSIS ---
-        st.subheader("💰 Financials & Lead Time Analysis")
-        if 'container_freight_usd' in df.columns and 'eta' in df.columns:
-            unique_pos = df['po_number'].unique()
-            for po in unique_pos:
-                po_df = df[df['po_number'] == po]
-                freight_cost = float(po_df['container_freight_usd'].iloc[0]) if not pd.isna(po_df['container_freight_usd'].iloc[0]) else 0
-                total_po_weight = po_df['total_weight_kg'].sum()
-                eta_str = po_df['eta'].iloc[0]
-                status = po_df['status'].iloc[0]
-                
-                # Timeline Logic
-                timeline_status = "Unknown"
-                if eta_str:
-                    eta_date = datetime.datetime.strptime(str(eta_str), "%Y-%m-%d").date()
-                    today = datetime.date.today()
-                    days_diff = (eta_date - today).days
-                    
-                    if "Delivered" in str(status):
-                        timeline_status = "✅ Arrived"
-                    elif days_diff < 0:
-                        timeline_status = f"🚨 LATE by {abs(days_diff)} days"
-                    else:
-                        timeline_status = f"⏳ ETA in {days_diff} days ({eta_date})"
-
-                with st.expander(f"📦 Details for {po} | Status: {status} | {timeline_status}"):
-                    st.write(f"**Total Container Freight Cost:** ${freight_cost:,.2f}")
-                    
-                    # Calculate Landed Cost per item
-                    calc_data = []
-                    for _, row in po_df.iterrows():
-                        qty = float(row['quantity'])
-                        weight = float(row['total_weight_kg'])
-                        prod_name = row['product']
-                        
-                        # Fetch base price from product data
-                        prod_info = next((p for p in product_data if p['product_name'] == prod_name), {})
-                        base_price = float(prod_info.get('price_usd') or 0)
-                        
-                        # Freight allocation by weight percentage
-                        weight_pct = weight / total_po_weight if total_po_weight > 0 else 0
-                        allocated_freight = freight_cost * weight_pct
-                        freight_per_unit = allocated_freight / qty if qty > 0 else 0
-                        landed_cost = base_price + freight_per_unit
-                        
-                        calc_data.append({
-                            "Product": prod_name,
-                            "Qty": qty,
-                            "Base Price (ea)": f"${base_price:,.2f}",
-                            "Freight Share (ea)": f"${freight_per_unit:,.2f}",
-                            "TRUE LANDED COST (ea)": f"${landed_cost:,.2f}"
-                        })
-                    
-                    st.table(pd.DataFrame(calc_data))
-        else:
-            st.info("Missing freight or timeline columns in database.")
-
-        st.divider()
-
         st.subheader("Global Shipment View")
         m = folium.Map(location=[25.0, -110.0], zoom_start=3, tiles="CartoDB positron") 
-        map_df = df.drop_duplicates(subset=['po_number'])
-        
-        for index, row in map_df.iterrows():
-            current_status = row['status']
-            if current_status in STATUS_COORDS:
-                coords = STATUS_COORDS[current_status]
-                pin_color = "green" if "Delivered" in current_status else "blue" if "Ocean" in current_status else "red"
-                folium.Marker(
-                    location=coords,
-                    popup=f"<b>PO: {row['po_number']}</b>",
-                    tooltip=f"{current_status}",
-                    icon=folium.Icon(color=pin_color, icon="info-sign")
-                ).add_to(m)
-
+        for index, row in df.drop_duplicates(subset=['po_number']).iterrows():
+            if row['status'] in STATUS_COORDS:
+                pin_color = "green" if "Delivered" in row['status'] else "blue" if "Ocean" in row['status'] else "red"
+                folium.Marker(location=STATUS_COORDS[row['status']], popup=f"<b>PO: {row['po_number']}</b>", tooltip=f"{row['status']}", icon=folium.Icon(color=pin_color, icon="info-sign")).add_to(m)
         st_folium(m, width=1200, height=450, returned_objects=[])
 
         st.divider()
-
         st.subheader("Update Shipment Status")
-        display_df = df[['id', 'po_number', 'provider', 'product', 'quantity', 'status']].copy()
+        display_cols = ['id', 'po_number', 'provider', 'product', 'quantity']
+        if 'total_parts' in df.columns: display_cols.append('total_parts')
+        display_cols.append('status')
+        
         edited_df = st.data_editor(
-            display_df,
+            df[display_cols].copy(),
             column_config={
-                "id": None, 
-                "po_number": st.column_config.TextColumn("PO Number", disabled=True),
+                "id": None, "po_number": st.column_config.TextColumn("PO Number", disabled=True),
                 "provider": st.column_config.TextColumn("Provider", disabled=True),
                 "product": st.column_config.TextColumn("Product", disabled=True),
-                "quantity": st.column_config.NumberColumn("Qty", disabled=True),
+                "quantity": st.column_config.NumberColumn("Shipping Units", disabled=True),
+                "total_parts": st.column_config.NumberColumn("Total Parts", disabled=True),
                 "status": st.column_config.SelectboxColumn("Current Status", options=list(STATUS_COORDS.keys()), required=True)
             },
             use_container_width=True, hide_index=True, key="data_editor"
         )
 
-        if st.button("Apply Changes", type="primary"):
-            changes_made = False
-            with st.spinner("Updating..."):
+        if st.button("Apply Changes & Send Alerts", type="primary"):
+            changes = False
+            with st.spinner("Updating database and dispatching alerts..."):
                 for index, row in edited_df.iterrows():
                     if df.loc[index, 'status'] != row['status']:
-                        supabase.table("shipments").update({"status": row['status']}).eq("id", row['id']).execute()
-                        changes_made = True
-            if changes_made:
+                        new_stat = row['status']
+                        supabase.table("shipments").update({"status": new_stat}).eq("id", row['id']).execute()
+                        changes = True
+                        if "Manzanillo" in new_stat or "Cuauhtémoc" in new_stat:
+                            send_status_alert(row['po_number'], new_stat)
+            if changes:
                 st.success("Updated! Refreshing...")
                 st.rerun()
     else:
-        st.info("No shipments active. Build a container or use Quick Add.")
+        st.info("No shipments active.")
 
 # ==========================================
-# TAB 2: CONTAINER BUILDER
+# ADMIN-ONLY TABS 
 # ==========================================
-with tab_build:
-    st.subheader("🏗️ Build & Fill a Consolidated Container")
-    
-    col_po, col_cap_w, col_cap_v = st.columns([2, 1, 1])
-    with col_po:
-        builder_po = st.text_input("Master PO / Container Number", key="builder_po")
-    with col_cap_w:
-        builder_cap_w = st.number_input("Max Weight (kg)", value=28000, key="builder_cap_w")
-    with col_cap_v:
-        builder_cap_v = st.number_input("Max Space (cu ft)", value=2690, key="builder_cap_v")
+if tab_build:
+    with tab_build:
+        st.subheader("🏗️ Build & Fill a Consolidated Container")
+        col_po, col_cap_w, col_cap_v = st.columns([2, 1, 1])
+        builder_po = col_po.text_input("Master PO", key="builder_po")
+        builder_cap_w = col_cap_w.number_input("Max Weight (kg)", value=28000)
+        builder_cap_v = col_cap_v.number_input("Max Space (cu ft)", value=2690)
 
-    # NEW: Freight & Timeline Inputs
-    col_fr, col_etd, col_eta = st.columns(3)
-    with col_fr:
-        builder_freight = st.number_input("Est. Container Freight Cost (USD)", value=8500.00, step=100.0)
-    with col_etd:
-        builder_etd = st.date_input("Estimated Departure (ETD)")
-    with col_eta:
-        builder_eta = st.date_input("Estimated Arrival (ETA)", value=datetime.date.today() + datetime.timedelta(days=45))
+        col_fr, col_etd, col_eta = st.columns(3)
+        builder_freight = col_fr.number_input("Est. Freight Cost (USD)", value=8500.0)
+        builder_etd = col_etd.date_input("ETD")
+        builder_eta = col_eta.date_input("ETA", value=datetime.date.today() + datetime.timedelta(days=45))
 
-    st.divider()
-    build_col1, build_col2 = st.columns([1, 1.5])
-
-    with build_col1:
-        st.markdown("#### 1. Add Pallets/Items")
-        if not vendor_list:
-            st.warning("⚠️ Add a Vendor in 'Manage Data' first.")
-        else:
-            b_vendor = st.selectbox("Select Vendor", vendor_list, key="b_vendor")
-            filtered_prods = [p for p in product_data if p['vendor_name'] == b_vendor]
-            prod_names = [p['product_name'] for p in filtered_prods] if filtered_prods else ["No products found"]
-            
-            b_product = st.selectbox("Select Product", prod_names, key="b_product")
-            b_qty = st.number_input("Quantity", min_value=1, value=1, key="b_qty")
-            
-            if st.button("➕ Stage Item in Container"):
-                if b_product != "No products found":
-                    prod = next((p for p in filtered_prods if p['product_name'] == b_product), {})
-                    weight = prod.get('weight_kg') or 0
-                    l_in = prod.get('length_in') or 0
-                    w_in = prod.get('width_in') or 0
-                    h_in = prod.get('height_in') or 0
-                    price = prod.get('price_usd') or 0
-                    
-                    unit_cu_ft = (l_in * w_in * h_in) / 1728
-                    
+        st.divider()
+        build_col1, build_col2 = st.columns([1, 1.8])
+        with build_col1:
+            if vendor_list:
+                b_vendor = st.selectbox("Select Vendor", vendor_list, key="b_vendor")
+                filtered_prods = [p for p in product_data if p['vendor_name'] == b_vendor]
+                b_product = st.selectbox("Select Product", [p['product_name'] for p in filtered_prods] if filtered_prods else ["None"], key="b_product")
+                
+                selected_prod_info = next((p for p in filtered_prods if p['product_name'] == b_product), {})
+                u_type = selected_prod_info.get('unit_type', 'Unit')
+                parts_per = float(selected_prod_info.get('parts_per_unit', 1))
+                
+                st.info(f"Shipping Unit: **{u_type}** | Contains: **{parts_per:,.0f} Parts**")
+                
+                b_qty = st.number_input(f"Quantity of {u_type}s to Load", min_value=1, value=1, key="b_qty")
+                
+                if st.button("➕ Stage Item"):
+                    unit_cu_ft = ((selected_prod_info.get('length_in') or 0) * (selected_prod_info.get('width_in') or 0) * (selected_prod_info.get('height_in') or 0)) / 1728
                     st.session_state.draft_container.append({
-                        "provider": b_vendor,
-                        "product": b_product,
-                        "quantity": b_qty,
-                        "total_weight": weight * b_qty,
+                        "provider": b_vendor, 
+                        "product": b_product, 
+                        "quantity": b_qty, 
+                        "total_parts": b_qty * parts_per,
+                        "unit_type": u_type,
+                        "total_weight": (selected_prod_info.get('weight_kg') or 0) * b_qty, 
                         "total_volume": unit_cu_ft * b_qty,
-                        "base_price": price
+                        "base_price": selected_prod_info.get('price_usd') or 0
                     })
                     st.rerun()
+            else: st.warning("Add a Vendor first.")
 
-    with build_col2:
-        st.markdown("#### 2. Container Overview")
-        if not st.session_state.draft_container:
-            st.info("Container is empty. Add items from the left.")
-        else:
-            draft_df = pd.DataFrame(st.session_state.draft_container)
-            curr_weight = draft_df['total_weight'].sum()
-            curr_vol = draft_df['total_volume'].sum()
-            
-            pc_w, pc_v = st.columns(2)
-            with pc_w:
-                st.caption(f"**Weight:** {curr_weight:,.0f} / {builder_cap_w:,.0f} kg")
-                st.progress(min(curr_weight / builder_cap_w if builder_cap_w > 0 else 0, 1.0))
-            with pc_v:
-                st.caption(f"**Space:** {curr_vol:,.1f} / {builder_cap_v:,.0f} cu ft")
-                st.progress(min(curr_vol / builder_cap_v if builder_cap_v > 0 else 0, 1.0))
-            
-            st.dataframe(draft_df[['provider', 'product', 'quantity', 'total_weight']], use_container_width=True, hide_index=True)
-            
-            col_ship, col_clear = st.columns(2)
-            with col_ship:
-                if st.button("🚀 Finalize & Ship Container", type="primary", use_container_width=True):
-                    if not builder_po:
-                        st.error("Enter a Master PO / Container Number first!")
-                    else:
-                        with st.spinner("Locking in container..."):
-                            for item in st.session_state.draft_container:
-                                new_data = {
-                                    "po_number": builder_po,
-                                    "provider": item['provider'],
-                                    "product": item['product'],
-                                    "quantity": item['quantity'],
-                                    "total_weight_kg": item['total_weight'],
-                                    "total_volume_cu_ft": item['total_volume'],
-                                    "max_capacity_kg": builder_cap_w,
-                                    "max_volume_cu_ft": builder_cap_v,
-                                    "container_freight_usd": builder_freight,
-                                    "etd": str(builder_etd),
-                                    "eta": str(builder_eta),
-                                    "status": "Factory (Guangzhou)" 
-                                }
-                                supabase.table("shipments").insert(new_data).execute()
-                            
-                            st.session_state.draft_container = [] 
-                            st.success(f"Container {builder_po} locked in!")
-                            st.rerun()
-            with col_clear:
-                if st.button("🗑️ Clear Draft", use_container_width=True):
-                    st.session_state.draft_container = []
-                    st.rerun()
-
-# ==========================================
-# TAB 3: QUICK ADD
-# ==========================================
-with tab_add:
-    st.subheader("📦 Quick Add to Existing PO")
-    if not vendor_list:
-        st.warning("⚠️ Add a Vendor first.")
-    else:
-        with st.form("add_shipment_form", clear_on_submit=True):
-            new_po = st.text_input("PO / Container Number")
-            selected_vendor = st.selectbox("Select Vendor", vendor_list, key="qa_vendor")
-            filtered_products = [p for p in product_data if p['vendor_name'] == selected_vendor]
-            prod_names = [p['product_name'] for p in filtered_products] if filtered_products else ["No products found"]
-            selected_product_name = st.selectbox("Select Product", prod_names, key="qa_prod")
-            
-            qty = st.number_input("Quantity", min_value=1, value=1, key="qa_qty")
-            qa_freight = st.number_input("Container Freight Cost (USD)", value=8500.0)
-            
-            col_d1, col_d2 = st.columns(2)
-            with col_d1:
-                qa_etd = st.date_input("ETD", key="qa_etd")
-            with col_d2:
-                qa_eta = st.date_input("ETA", key="qa_eta")
-                
-            initial_status = st.selectbox("Initial Status", list(STATUS_COORDS.keys()))
-            
-            if st.form_submit_button("Add to Database"):
-                if new_po and selected_product_name != "No products found":
-                    prod = next((p for p in filtered_products if p['product_name'] == selected_product_name), {})
-                    weight = prod.get('weight_kg') or 0
-                    l_in = prod.get('length_in') or 0
-                    w_in = prod.get('width_in') or 0
-                    h_in = prod.get('height_in') or 0
-                    unit_cu_ft = (l_in * w_in * h_in) / 1728
-                    
-                    new_data = {
-                        "po_number": new_po,
-                        "provider": selected_vendor,
-                        "product": selected_product_name,
-                        "quantity": qty,
-                        "total_weight_kg": weight * qty,
-                        "total_volume_cu_ft": unit_cu_ft * qty,
-                        "max_capacity_kg": 28000,
-                        "max_volume_cu_ft": 2690,
-                        "container_freight_usd": qa_freight,
-                        "etd": str(qa_etd),
-                        "eta": str(qa_eta),
-                        "status": initial_status
-                    }
-                    supabase.table("shipments").insert(new_data).execute()
-                    st.success(f"Added {qty}x {selected_product_name} to PO {new_po}.")
-                    st.rerun()
-
-# ==========================================
-# TAB 4: MANAGE VENDORS & PRODUCTS
-# ==========================================
-with tab_manage:
-    st.subheader("🏢 Database Management")
-    manage_vendors, manage_products = st.tabs(["🏭 Manage Vendors", "📦 Manage Products"])
-    
-    with manage_vendors:
-        col_v_add, col_v_edit = st.columns([1, 2])
-        with col_v_add:
-            st.markdown("#### Add New Vendor")
-            with st.form("add_vendor_form", clear_on_submit=True):
-                new_vendor_name = st.text_input("Vendor Name")
-                if st.form_submit_button("Save Vendor") and new_vendor_name:
-                    supabase.table("vendors").insert({"vendor_name": new_vendor_name}).execute()
-                    st.success("Added Vendor")
-                    st.rerun()
-                    
-        with col_v_edit:
-            st.markdown("#### Edit Existing Vendors")
-            if vendor_data:
-                v_df = pd.DataFrame(vendor_data)
-                edited_v_df = st.data_editor(
-                    v_df,
-                    column_config={"id": None, "vendor_name": st.column_config.TextColumn("Vendor Name", required=True)},
-                    use_container_width=True, hide_index=True, key="edit_vendors"
-                )
-                if st.button("💾 Save Vendor Edits", type="primary"):
-                    for index, row in edited_v_df.iterrows():
-                        if v_df.loc[index, 'vendor_name'] != row['vendor_name']:
-                            supabase.table("vendors").update({"vendor_name": row['vendor_name']}).eq("id", row['id']).execute()
-                    st.success("Vendors updated successfully!")
-                    st.rerun()
-
-    with manage_products:
-        col_p_add, col_p_edit = st.columns([1, 2.5])
-        with col_p_add:
-            st.markdown("#### Add New Product")
-            if not vendor_list:
-                st.warning("Add a vendor first.")
+        with build_col2:
+            st.markdown("#### 2. Container Overview")
+            if not st.session_state.draft_container:
+                st.info("Container is empty. Add items from the left.")
             else:
-                with st.form("add_product_form", clear_on_submit=True):
-                    new_product_name = st.text_input("Product Name")
-                    assign_to_vendor = st.selectbox("Assign to Vendor", vendor_list)
-                    
-                    st.markdown("**Financials & Weight**")
-                    new_price = st.number_input("Base Price (USD)", min_value=0.0, step=1.0)
-                    new_weight = st.number_input("Weight (kg)", min_value=0.0, step=0.1)
-                    
-                    st.markdown("**Dimensions (Inches)**")
-                    l_in = st.number_input("Length", min_value=0.0)
-                    w_in = st.number_input("Width", min_value=0.0)
-                    h_in = st.number_input("Height", min_value=0.0)
-                    
-                    if st.form_submit_button("Save Product") and new_product_name:
-                        supabase.table("products").insert({
-                            "product_name": new_product_name, 
-                            "vendor_name": assign_to_vendor,
-                            "price_usd": new_price,
-                            "weight_kg": new_weight,
-                            "length_in": l_in,
-                            "width_in": w_in,
-                            "height_in": h_in
-                        }).execute()
-                        st.success(f"Added: {new_product_name}")
-                        st.rerun()
-                        
-        with col_p_edit:
-            st.markdown("#### Edit Existing Products")
-            if product_data:
-                p_df = pd.DataFrame(product_data)
-                edited_p_df = st.data_editor(
-                    p_df,
+                draft_df = pd.DataFrame(st.session_state.draft_container)
+                curr_w, curr_v = draft_df['total_weight'].sum(), draft_df['total_volume'].sum()
+                curr_parts = draft_df['total_parts'].sum()
+                
+                # --- NEW: Parts Counter & Progress Bars ---
+                c_p, c_w, c_v = st.columns([1, 1.5, 1.5])
+                with c_p:
+                    st.metric("Total Parts", f"{curr_parts:,.0f}")
+                with c_w:
+                    st.caption(f"**Weight:** {curr_w:,.0f} / {builder_cap_w:,.0f} kg")
+                    st.progress(min(curr_w / builder_cap_w if builder_cap_w > 0 else 0, 1.0))
+                with c_v:
+                    st.caption(f"**Space:** {curr_v:,.1f} / {builder_cap_v:,.0f} cu ft")
+                    st.progress(min(curr_v / builder_cap_v if builder_cap_v > 0 else 0, 1.0))
+                
+                st.markdown("**Staged Items Breakdown**")
+                
+                # --- NEW: Calculate Itemized Percentages ---
+                draft_df['wt_pct'] = (draft_df['total_weight'] / builder_cap_w) * 100 if builder_cap_w > 0 else 0
+                draft_df['vol_pct'] = (draft_df['total_volume'] / builder_cap_v) * 100 if builder_cap_v > 0 else 0
+
+                edited_draft = st.data_editor(
+                    draft_df[['provider', 'product', 'quantity', 'unit_type', 'total_parts', 'wt_pct', 'vol_pct']],
                     column_config={
-                        "id": None, 
-                        "product_name": st.column_config.TextColumn("Product", required=True),
-                        "vendor_name": st.column_config.SelectboxColumn("Vendor", options=vendor_list, required=True),
-                        "price_usd": st.column_config.NumberColumn("Price ($)", min_value=0.0),
-                        "weight_kg": st.column_config.NumberColumn("Weight (kg)", min_value=0.0),
-                        "length_in": st.column_config.NumberColumn("L (in)", min_value=0.0),
-                        "width_in": st.column_config.NumberColumn("W (in)", min_value=0.0),
-                        "height_in": st.column_config.NumberColumn("H (in)", min_value=0.0)
+                        "provider": st.column_config.TextColumn("Provider", disabled=True),
+                        "product": st.column_config.TextColumn("Product", disabled=True),
+                        "quantity": st.column_config.NumberColumn("Qty", min_value=1),
+                        "unit_type": st.column_config.TextColumn("Type", disabled=True),
+                        "total_parts": st.column_config.NumberColumn("Parts", disabled=True),
+                        "wt_pct": st.column_config.NumberColumn("Weight %", format="%.1f%%", disabled=True),
+                        "vol_pct": st.column_config.NumberColumn("Space %", format="%.1f%%", disabled=True)
                     },
-                    use_container_width=True, hide_index=True, key="edit_products"
+                    use_container_width=True, hide_index=True, num_rows="dynamic", key="draft_editor"
                 )
                 
-                if st.button("💾 Save Product Edits", type="primary"):
-                    for index, row in edited_p_df.iterrows():
-                        orig_row = p_df.iloc[index]
-                        if any(orig_row.get(col) != row.get(col) for col in ['product_name', 'vendor_name', 'price_usd', 'weight_kg', 'length_in', 'width_in', 'height_in']):
-                            supabase.table("products").update({
-                                "product_name": row['product_name'],
-                                "vendor_name": row['vendor_name'],
-                                "price_usd": row.get('price_usd', 0),
-                                "weight_kg": row.get('weight_kg', 0),
-                                "length_in": row.get('length_in', 0),
-                                "width_in": row.get('width_in', 0),
-                                "height_in": row.get('height_in', 0)
-                            }).eq("id", row['id']).execute()
-                    st.success("Products updated successfully!")
+                if st.button("🔄 Update Draft Math", use_container_width=True):
+                    new_draft = []
+                    for _, row in edited_draft.iterrows():
+                        prod = next((p for p in product_data if p['product_name'] == row['product']), {})
+                        unit_wt = prod.get('weight_kg') or 0
+                        parts_per = float(prod.get('parts_per_unit', 1))
+                        unit_vol = ((prod.get('length_in') or 0) * (prod.get('width_in') or 0) * (prod.get('height_in') or 0)) / 1728
+                        new_draft.append({
+                            "provider": row['provider'], "product": row['product'], "quantity": row['quantity'],
+                            "total_parts": row['quantity'] * parts_per, "unit_type": row['unit_type'],
+                            "total_weight": unit_wt * row['quantity'], "total_volume": unit_vol * row['quantity'],
+                            "base_price": prod.get('price_usd') or 0
+                        })
+                    st.session_state.draft_container = new_draft
+                    st.rerun()
+
+                col_ship, col_clear = st.columns(2)
+                with col_ship:
+                    if st.button("🚀 Finalize & Ship", type="primary", use_container_width=True):
+                        if not builder_po:
+                            st.error("Enter a Master PO first!")
+                        else:
+                            for item in st.session_state.draft_container:
+                                supabase.table("shipments").insert({
+                                    "po_number": builder_po, "provider": item['provider'], "product": item['product'], 
+                                    "quantity": item['quantity'], "total_parts": item['total_parts'],
+                                    "total_weight_kg": item['total_weight'], "total_volume_cu_ft": item['total_volume'],
+                                    "max_capacity_kg": builder_cap_w, "max_volume_cu_ft": builder_cap_v,
+                                    "container_freight_usd": builder_freight, "etd": str(builder_etd), "eta": str(builder_eta),
+                                    "status": "Factory (Guangzhou)" 
+                                }).execute()
+                            st.session_state.draft_container = [] 
+                            st.rerun()
+                with col_clear:
+                    if st.button("🗑️ Clear Draft", use_container_width=True):
+                        st.session_state.draft_container = []
+                        st.rerun()
+
+if tab_add:
+    with tab_add:
+        st.subheader("📦 Quick Add to Existing PO")
+        if vendor_list:
+            with st.form("add_shipment_form", clear_on_submit=True):
+                new_po = st.text_input("PO / Container Number")
+                selected_vendor = st.selectbox("Select Vendor", vendor_list)
+                filtered = [p for p in product_data if p['vendor_name'] == selected_vendor]
+                selected_product = st.selectbox("Select Product", [p['product_name'] for p in filtered] if filtered else ["None"])
+                
+                qty = st.number_input("Quantity of Shipping Units (Pallets/Pieces)", min_value=1, value=1)
+                
+                if st.form_submit_button("Add to Database") and new_po and selected_product != "None":
+                    prod = next((p for p in filtered if p['product_name'] == selected_product), {})
+                    unit_cu_ft = ((prod.get('length_in') or 0) * (prod.get('width_in') or 0) * (prod.get('height_in') or 0)) / 1728
+                    parts_per = float(prod.get('parts_per_unit', 1))
+                    
+                    supabase.table("shipments").insert({
+                        "po_number": new_po, "provider": selected_vendor, "product": selected_product, 
+                        "quantity": qty, "total_parts": qty * parts_per,
+                        "total_weight_kg": (prod.get('weight_kg') or 0) * qty, "total_volume_cu_ft": unit_cu_ft * qty,
+                        "max_capacity_kg": 28000, "max_volume_cu_ft": 2690, "container_freight_usd": 8500,
+                        "etd": str(datetime.date.today()), "eta": str(datetime.date.today() + datetime.timedelta(days=45)),
+                        "status": "Factory (Guangzhou)"
+                    }).execute()
+                    st.rerun()
+
+if tab_manage:
+    with tab_manage:
+        st.subheader("🏢 Database Management")
+        manage_vendors, manage_products = st.tabs(["🏭 Vendors", "📦 Products"])
+        
+        with manage_vendors:
+            with st.form("add_vendor_form"):
+                new_v = st.text_input("New Vendor Name")
+                if st.form_submit_button("Add") and new_v:
+                    supabase.table("vendors").insert({"vendor_name": new_v}).execute()
+                    st.rerun()
+            
+            if vendor_data:
+                v_df = st.data_editor(pd.DataFrame(vendor_data), column_config={"id": None}, use_container_width=True, hide_index=True, num_rows="dynamic")
+                if st.button("Save Vendors", type="primary"):
+                    for i, r in v_df.iterrows():
+                        if i < len(vendor_data):
+                            if pd.DataFrame(vendor_data).loc[i, 'vendor_name'] != r['vendor_name']:
+                                supabase.table("vendors").update({"vendor_name": r['vendor_name']}).eq("id", r['id']).execute()
+                        else:
+                            supabase.table("vendors").insert({"vendor_name": r['vendor_name']}).execute()
+                    st.rerun()
+
+        with manage_products:
+            with st.form("add_prod_form"):
+                new_p = st.text_input("Product Name")
+                v_assign = st.selectbox("Vendor", vendor_list)
+                
+                st.markdown("**Shipping Unit Configuration**")
+                col_u1, col_u2 = st.columns(2)
+                u_type = col_u1.selectbox("Unit Type", ["Pallet", "Piece", "Crate", "Bundle"])
+                p_per = col_u2.number_input("How many parts in this unit?", min_value=1, value=1)
+                
+                st.markdown("**Financials & Weight (Per Shipping Unit)**")
+                price = st.number_input("Base Price per PART ($)", min_value=0.0)
+                wt = st.number_input("Weight per UNIT (kg)", min_value=0.0)
+                
+                st.markdown("**Dimensions (Inches per UNIT)**")
+                l_in, w_in, h_in = st.columns(3)
+                len_in = l_in.number_input("L (in)", min_value=0.0)
+                wid_in = w_in.number_input("W (in)", min_value=0.0)
+                ht_in = h_in.number_input("H (in)", min_value=0.0)
+                
+                if st.form_submit_button("Add") and new_p:
+                    supabase.table("products").insert({
+                        "product_name": new_p, "vendor_name": v_assign, "price_usd": price, 
+                        "unit_type": u_type, "parts_per_unit": p_per,
+                        "weight_kg": wt, "length_in": len_in, "width_in": wid_in, "height_in": ht_in
+                    }).execute()
+                    st.rerun()
+                    
+            if product_data:
+                p_df = st.data_editor(
+                    pd.DataFrame(product_data), 
+                    column_config={
+                        "id": None, "vendor_name": st.column_config.SelectboxColumn(options=vendor_list),
+                        "unit_type": st.column_config.SelectboxColumn(options=["Pallet", "Piece", "Crate", "Bundle"]),
+                        "parts_per_unit": st.column_config.NumberColumn("Parts/Unit", min_value=1)
+                    }, 
+                    use_container_width=True, hide_index=True, num_rows="dynamic"
+                )
+                if st.button("Save Products", type="primary"):
+                    for i, r in p_df.iterrows():
+                        if i < len(product_data):
+                            orig = pd.DataFrame(product_data).iloc[i]
+                            cols_to_check = ['product_name', 'vendor_name', 'price_usd', 'unit_type', 'parts_per_unit', 'weight_kg', 'length_in', 'width_in', 'height_in']
+                            if any(orig.get(c) != r.get(c) for c in cols_to_check):
+                                supabase.table("products").update({c: r.get(c, 0) if c != 'unit_type' else r.get(c, 'Piece') for c in cols_to_check}).eq("id", r['id']).execute()
+                        else:
+                            supabase.table("products").insert({c: r.get(c, 0) if c != 'unit_type' else r.get(c, 'Piece') for c in ['product_name', 'vendor_name', 'price_usd', 'unit_type', 'parts_per_unit', 'weight_kg', 'length_in', 'width_in', 'height_in']}).execute()
                     st.rerun()
